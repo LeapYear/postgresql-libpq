@@ -165,7 +165,6 @@ module Database.PostgreSQL.LibPQ
     , isBusy
     , setnonblocking
     , isnonblocking
-    , setSingleRowMode
     , FlushStatus(..)
     , flush
 
@@ -1490,22 +1489,29 @@ unescapeBytea bs =
 --   be properly processed as an SQL identifier. The return string will also
 --   be surrounded by double quotes.
 --
---   On error, @escapeIdentifier@ returns 'Nothing' and a suitable message
---   is stored in the conn object.
+--   The original contract for this function had:
+--
+--   "On error, @escapeIdentifier@ returns 'Nothing' and a suitable message
+--   is stored in the conn object."
+--
+--   Because we have no way to set the error message in the conn object, we
+--   cannot fail gracefully.
 
 escapeIdentifier :: Connection
                  -> B.ByteString
                  -> IO (Maybe B.ByteString)
-escapeIdentifier connection bs =
-  withConn connection $ \conn ->
-    B.unsafeUseAsCStringLen bs $ \(from, bslen) -> mask_ $ do
-      bs'ptr <- c_PQescapeIdentifier conn from (fromIntegral bslen)
-      if bs'ptr == nullPtr
-        then return Nothing
-        else do
-            bs' <- B.packCString bs'ptr
-            c_PQfreemem bs'ptr
-            return $ Just bs'
+escapeIdentifier connection bs = do
+  encoding <- clientEncoding connection
+  case encoding of
+    -- see https://www.postgresql.org/docs/8.3/static/multibyte.html#CHARSET-TABLE for encodings
+    "UTF8" ->
+      return $ Just $ B.concat
+        [ "\""
+        , B.intercalate "\"\"" $ B.split (toEnum (fromEnum '"')) bs
+        , "\""
+        ]
+    _ -> error $ "unhandled encoding (" ++ show encoding ++ ") in escapeIdentifier"
+
 
 -- $copy
 --
@@ -1807,19 +1813,6 @@ setnonblocking connection blocking =
 isnonblocking :: Connection
               -> IO Bool
 isnonblocking connection = enumFromConn connection c_PQisnonblocking
-
-
--- | Select single-row mode for the currently-executing query.
---
--- This function can only be called immediately after PQsendQuery or one of its
--- sibling functions, before any other operation on the connection such as
--- PQconsumeInput or PQgetResult. If called at the correct time, the function
--- activates single-row mode for the current query and returns 1. Otherwise the
--- mode stays unchanged and the function returns 0. In any case, the mode
--- reverts to normal after completion of the current query.
-setSingleRowMode :: Connection
-                 -> IO Bool
-setSingleRowMode connection = enumFromConn connection c_PQsetSingleRowMode
 
 
 data FlushStatus = FlushOk
@@ -2486,9 +2479,6 @@ foreign import ccall        "libpq-fe.h PQsetnonblocking"
 foreign import ccall unsafe "libpq-fe.h PQisnonblocking"
     c_PQisnonblocking :: Ptr PGconn -> IO CInt
 
-foreign import ccall unsafe "libpq-fe.h PQsetSingleRowMode"
-    c_PQsetSingleRowMode :: Ptr PGconn -> IO CInt
-
 foreign import ccall        "libpq-fe.h PQgetResult"
     c_PQgetResult :: Ptr PGconn -> IO (Ptr PGresult)
 
@@ -2599,12 +2589,6 @@ foreign import ccall        "libpq-fe.h PQunescapeBytea"
     c_PQunescapeBytea :: CString -- Actually (Ptr CUChar)
                       -> Ptr CSize
                       -> IO (Ptr Word8) -- Actually (IO (Ptr CUChar))
-
-foreign import ccall unsafe "libpq-fe.h PQescapeIdentifier"
-    c_PQescapeIdentifier :: Ptr PGconn
-                         -> CString
-                         -> CSize
-                         -> IO CString
 
 foreign import ccall unsafe "libpq-fe.h &PQfreemem"
     p_PQfreemem :: FunPtr (Ptr a -> IO ())
